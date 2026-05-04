@@ -1,0 +1,27 @@
+[project]
+name = "downselector"
+version = "0.1.0"
+description = "KiCad 10 IPC tool for downselecting selected PCB tracks and vias by size, layers, net, and net class."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "kicad-python>=0.7.1",
+]
+
+[project.scripts]
+downselector = "downselector.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["downselector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

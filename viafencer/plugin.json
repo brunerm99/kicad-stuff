@@ -1,0 +1,22 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "viafencer",
+  "name": "Via Fencer",
+  "description": "Create ground via fences around selected RF tracks and arcs.",
+  "runtime": {
+    "type": "python",
+    "min_version": "3.10"
+  },
+  "actions": [
+    {
+      "identifier": "open",
+      "name": "Via Fencer",
+      "description": "Fence selected RF tracks and arc tracks with ground vias.",
+      "entrypoint": "main.py",
+      "show-button": true,
+      "scopes": [
+        "pcb"
+      ]
+    }
+  ]
+}

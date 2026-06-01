@@ -10,6 +10,8 @@ dependencies = [
 
 [project.scripts]
 viafencer = "viafencer.app:main"
+zonestitcher = "viafencer.zone_app:main"
+maskexpander = "viafencer.mask_app:main"
 
 [dependency-groups]
 dev = [

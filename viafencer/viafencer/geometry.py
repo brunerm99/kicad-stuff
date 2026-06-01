@@ -30,6 +30,7 @@ class TrackGeometry:
     width_nm: int
     mid: Point | None = None
     label: str = ""
+    layer: int | None = None
 
 
 @dataclass(frozen=True)

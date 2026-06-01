@@ -1,8 +1,8 @@
 {
   "$schema": "https://go.kicad.org/api/schemas/v1",
   "identifier": "viafencer",
-  "name": "Via Fencer",
-  "description": "Create ground via fences around selected RF tracks and arcs.",
+  "name": "KiCad Via Tools",
+  "description": "Create RF via fences, conservative zone stitch via grids, and RF solder-mask openings.",
   "runtime": {
     "type": "python",
     "min_version": "3.10"
@@ -13,6 +13,26 @@
       "name": "Via Fencer",
       "description": "Fence selected RF tracks and arc tracks with ground vias.",
       "entrypoint": "main.py",
+      "show-button": true,
+      "scopes": [
+        "pcb"
+      ]
+    },
+    {
+      "identifier": "zone-stitcher",
+      "name": "Zone Stitcher",
+      "description": "Via stitch a selected filled copper zone with collision filtering.",
+      "entrypoint": "zone_stitcher.py",
+      "show-button": true,
+      "scopes": [
+        "pcb"
+      ]
+    },
+    {
+      "identifier": "mask-expander",
+      "name": "RF Mask Expander",
+      "description": "Create side-offset solder-mask opening zones around selected RF tracks.",
+      "entrypoint": "mask_expander.py",
       "show-button": true,
       "scopes": [
         "pcb"

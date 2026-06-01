@@ -7,16 +7,20 @@ import os
 import uuid
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Iterable
+from time import sleep
+from typing import Any, Callable, Iterable, TypeVar
 
 from .geometry import CircularObstacle, Point, TrackGeometry
 
 DEFAULT_SOCKET = "ipc:///tmp/kicad/api.sock"
 NO_NET = "(no net)"
 CREATE_CHUNK_SIZE = 250
+KICAD_READY_RETRIES = 3
+KICAD_READY_RETRY_DELAY_S = 0.5
 LOGGER = logging.getLogger(__name__)
 FIRST_COPPER_LAYER = 3
 LAST_COPPER_LAYER = 34
+T = TypeVar("T")
 
 GROUND_NET_PRIORITY = ("GND", "GNDA", "AGND", "DGND", "PGND", "VSS", "0")
 
@@ -25,6 +29,7 @@ GROUND_NET_PRIORITY = ("GND", "GNDA", "AGND", "DGND", "PGND", "VSS", "0")
 class CreationSummary:
     via_count: int
     grouped: bool
+    group_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -175,12 +180,34 @@ class KiCadFenceSession:
         end_layer: int | None = None,
         grouped: bool = True,
     ) -> CreationSummary:
+        return self.create_vias(
+            centers,
+            net_name,
+            via_diameter_nm,
+            drill_diameter_nm,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            grouped=grouped,
+            group_name="RF Via Fence",
+        )
+
+    def create_vias(
+        self,
+        centers: Iterable[Point],
+        net_name: str,
+        via_diameter_nm: int,
+        drill_diameter_nm: int,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
+        grouped: bool = True,
+        group_name: str = "Generated Vias",
+    ) -> CreationSummary:
         centers = list(centers)
         if not centers:
             return CreationSummary(via_count=0, grouped=False)
 
         LOGGER.info("Looking up via net %s", net_name)
-        net = self._find_net(net_name)
+        self._find_net(net_name)
         layer_options = self.copper_layer_options()
         if start_layer is None or end_layer is None:
             default_pair = _default_layer_pair(layer_options)
@@ -192,91 +219,87 @@ class KiCadFenceSession:
         if layer_errors:
             raise RuntimeError("\n".join(layer_errors))
 
-        from kipy.board_types import Via
-        from kipy.geometry import Vector2
-
-        via_type = _via_type_for_layer_span(start_layer, end_layer, layer_options)
         LOGGER.info(
-            "Beginning KiCad via-create commit for %d vias on layers %s -> %s",
+            "Creating %d via items from native board strings on layers %s -> %s",
             len(centers),
             _layer_label(start_layer, layer_options),
             _layer_label(end_layer, layer_options),
         )
-        commit = self.board.begin_commit()
-        created_vias = []
-        commit_open = True
-        vias = []
-        try:
-            for center in centers:
-                via = Via()
-                _ensure_item_id(via)
-                via.position = Vector2.from_xy(round(center.x), round(center.y))
-                via.net = net
-                via.type = via_type
-                via.padstack.drill.start_layer = start_layer
-                via.padstack.drill.end_layer = end_layer
-                via.diameter = via_diameter_nm
-                via.drill_diameter = drill_diameter_nm
-                vias.append(via)
-
-            LOGGER.info(
-                "Prepared %d vias with %d assigned IDs",
-                len(vias),
-                sum(1 for via in vias if _id_text(via.id)),
+        via_ids = [str(uuid.uuid4()) for _center in centers]
+        via_texts = [
+            _via_as_board_string(
+                via_id,
+                center,
+                net_name,
+                via_diameter_nm,
+                drill_diameter_nm,
+                start_layer,
+                end_layer,
+                layer_options,
             )
-            for index, chunk in enumerate(_chunks(vias, CREATE_CHUNK_SIZE), start=1):
-                LOGGER.info(
-                    "Creating via chunk %d: %d vias",
-                    index,
-                    len(chunk),
-                )
-                created_vias.extend(self.board.create_items(chunk))
+            for via_id, center in zip(via_ids, centers)
+        ]
 
-            LOGGER.info("Pushing KiCad via-create commit")
-            self.board.push_commit(commit, "Create RF via fence vias")
-            commit_open = False
-        except Exception:
-            if commit_open:
-                LOGGER.exception("Via creation failed; dropping KiCad commit")
-                try:
-                    self.board.drop_commit(commit)
-                except Exception:
-                    LOGGER.exception("Failed to drop KiCad commit after via creation error")
-            raise
+        LOGGER.info(
+            "Prepared %d vias with %d assigned IDs",
+            len(via_texts),
+            len(via_ids),
+        )
+        for index, chunk in enumerate(_chunks(via_texts, CREATE_CHUNK_SIZE), start=1):
+            LOGGER.info(
+                "Creating via chunk %d: %d vias",
+                index,
+                len(chunk),
+            )
+            _retry_kicad_ready(
+                lambda chunk=chunk: _parse_and_create_items_from_string(self.board, "".join(chunk)),
+                "creating via chunk",
+            )
+
+        created_vias = _retry_kicad_ready(
+            lambda: self._get_vias_by_ids(via_ids),
+            "reading created vias",
+        )
+        if len(created_vias) != len(via_ids):
+            LOGGER.warning(
+                "Created %d vias, but KiCad returned %d of them by ID",
+                len(via_ids),
+                len(created_vias),
+            )
 
         created_group = None
-        if grouped and created_vias:
-            via_ids = [_id_text(via.id) for via in vias]
+        group_error = None
+        if grouped and via_ids:
             group_id = str(uuid.uuid4())
-            group_text = _group_as_board_string(group_id, "RF Via Fence", via_ids)
-            group_commit = self.board.begin_commit()
-            group_commit_open = True
+            group_text = _group_as_board_string(group_id, group_name, via_ids)
             try:
                 LOGGER.info("Creating native KiCad group for %d vias", len(via_ids))
-                _parse_and_create_items_from_string(self.board, group_text)
-                LOGGER.info("Pushing KiCad group-create commit")
-                self.board.push_commit(group_commit, "Group RF via fence")
-                group_commit_open = False
+                _retry_kicad_ready(
+                    lambda: _parse_and_create_items_from_string(self.board, group_text),
+                    "creating native KiCad group",
+                )
             except Exception:
-                if group_commit_open:
-                    try:
-                        self.board.drop_commit(group_commit)
-                    except Exception:
-                        LOGGER.exception("Failed to drop KiCad group commit")
-                LOGGER.exception("Created vias, but failed to create group")
-                raise RuntimeError(
-                    f"Created {len(created_vias)} vias, but failed to create the KiCad group."
-                )
+                group_error = f"Created {len(created_vias)} vias, but failed to create the KiCad group."
+                LOGGER.exception(group_error)
 
-            created_group = self._get_group_by_id(group_id)
-            if created_group is None:
-                raise RuntimeError(
-                    f"Created {len(created_vias)} vias, but KiCad did not return the new group."
+            if group_error is None:
+                created_group = _retry_kicad_ready(
+                    lambda: self._get_group_by_id(group_id),
+                    "reading created group",
                 )
+                if created_group is None:
+                    group_error = (
+                        f"Created {len(created_vias)} vias, but KiCad did not return the new group."
+                    )
+                    LOGGER.error(group_error)
 
         LOGGER.info("Selecting created %s", "group" if created_group else "vias")
         self._select_created_items([created_group] if created_group else created_vias)
-        return CreationSummary(via_count=len(created_vias), grouped=created_group is not None)
+        return CreationSummary(
+            via_count=len(via_ids),
+            grouped=created_group is not None,
+            group_error=group_error,
+        )
 
     def _get_track_selection(self) -> list[Any]:
         try:
@@ -311,6 +334,7 @@ class KiCadFenceSession:
             end=end,
             width_nm=width_nm,
             label=label,
+            layer=_int_or_none(getattr(item, "layer", None)),
         )
 
     def _find_net(self, net_name: str) -> Any:
@@ -333,6 +357,30 @@ class KiCadFenceSession:
             if _id_text(group.id) == group_id:
                 return group
         return None
+
+    def _get_vias_by_ids(self, via_ids: list[str]) -> list[Any]:
+        wanted = set(via_ids)
+        if hasattr(self.board, "get_items_by_id"):
+            try:
+                from kipy.proto.common.types import KIID
+
+                items = self.board.get_items_by_id([KIID(value=via_id) for via_id in via_ids])
+                by_item_id = {
+                    _id_text(item.id): item
+                    for item in items
+                    if _id_text(getattr(item, "id", "")) in wanted
+                }
+                if by_item_id:
+                    return [by_item_id[via_id] for via_id in via_ids if via_id in by_item_id]
+            except Exception:
+                LOGGER.exception("Could not read created vias by ID")
+
+        by_id = {
+            _id_text(via.id): via
+            for via in self.board.get_vias()
+            if _id_text(getattr(via, "id", "")) in wanted
+        }
+        return [by_id[via_id] for via_id in via_ids if via_id in by_id]
 
 
 def _is_track_item(item: Any) -> bool:
@@ -379,17 +427,6 @@ def _id_text(value: Any) -> str:
     return str(getattr(value, "value", value) or "")
 
 
-def _ensure_item_id(item: Any) -> None:
-    item_id = getattr(item, "id", None)
-    if _id_text(item_id):
-        return
-
-    proto = getattr(item, "proto", None)
-    proto_id = getattr(proto, "id", None)
-    if proto_id is not None:
-        proto_id.value = str(uuid.uuid4())
-
-
 def _group_as_board_string(group_id: str, name: str, member_ids: list[str]) -> str:
     members = " ".join(f'"{member_id}"' for member_id in member_ids)
     return (
@@ -398,6 +435,48 @@ def _group_as_board_string(group_id: str, name: str, member_ids: list[str]) -> s
         f"\t(members {members})\n"
         ")\n"
     )
+
+
+def _via_as_board_string(
+    via_id: str,
+    center: Point,
+    net_name: str,
+    via_diameter_nm: int,
+    drill_diameter_nm: int,
+    start_layer: int,
+    end_layer: int,
+    layer_options: list[LayerOption],
+) -> str:
+    via_kind = " blind" if _default_layer_pair(layer_options) != (start_layer, end_layer) else ""
+    return (
+        f"(via{via_kind}\n"
+        f"\t(at {_format_board_mm(center.x)} {_format_board_mm(center.y)})\n"
+        f"\t(size {_format_board_mm(via_diameter_nm)})\n"
+        f"\t(drill {_format_board_mm(drill_diameter_nm)})\n"
+        f'\t(layers "{_escape_pcb_string(_file_layer_name(start_layer))}" '
+        f'"{_escape_pcb_string(_file_layer_name(end_layer))}")\n'
+        f'\t(net "{_escape_pcb_string(net_name)}")\n'
+        f'\t(uuid "{_escape_pcb_string(via_id)}")\n'
+        ")\n"
+    )
+
+
+def _format_board_mm(value_nm: float | int) -> str:
+    text = f"{round(value_nm) / 1_000_000:.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _file_layer_name(layer: int) -> str:
+    try:
+        from kipy.util.board_layer import canonical_name
+
+        name = canonical_name(layer)
+        if name != "Unknown":
+            return name
+    except Exception:
+        LOGGER.exception("Could not load canonical KiCad layer name for layer %d", layer)
+
+    return _canonical_copper_layer_name(layer)
 
 
 def _escape_pcb_string(value: str) -> str:
@@ -427,9 +506,32 @@ def _parse_and_create_items_from_string(board: Any, contents: str) -> None:
     reply.ParseFromString(reply_data.bytes)
 
     if reply.status.status != ApiStatusCode.AS_OK:
-        raise RuntimeError(reply.status.error_message or "KiCad rejected group creation")
+        raise RuntimeError(reply.status.error_message or "KiCad rejected item creation")
     if client._kicad_token == "":
         client._kicad_token = reply.header.kicad_token
+
+
+def _retry_kicad_ready(action: Callable[[], T], description: str) -> T:
+    for attempt in range(KICAD_READY_RETRIES + 1):
+        try:
+            return action()
+        except Exception as exc:
+            if not _is_kicad_not_ready_error(exc) or attempt >= KICAD_READY_RETRIES:
+                raise
+            LOGGER.warning(
+                "KiCad was not ready while %s; retrying %d/%d",
+                description,
+                attempt + 1,
+                KICAD_READY_RETRIES,
+            )
+            sleep(KICAD_READY_RETRY_DELAY_S)
+
+    raise RuntimeError("unreachable retry state")
+
+
+def _is_kicad_not_ready_error(exc: Exception) -> bool:
+    raw_message = getattr(exc, "_raw_message", "")
+    return "KiCad is not ready to reply" in str(raw_message or exc)
 
 
 def _is_copper_layer(layer: int) -> bool:
@@ -482,17 +584,6 @@ def _validate_layer_pair(
     if layer_order[start_layer] >= layer_order[end_layer]:
         return ["Start layer must be above the stop layer in the board stack."]
     return []
-
-
-def _via_type_for_layer_span(
-    start_layer: int, end_layer: int, layer_options: list[LayerOption]
-) -> Any:
-    from kipy.board_types import ViaType
-
-    default_pair = _default_layer_pair(layer_options)
-    if default_pair == (start_layer, end_layer):
-        return ViaType.VT_THROUGH
-    return ViaType.VT_BLIND_BURIED
 
 
 def _layer_label(layer: int, layer_options: list[LayerOption]) -> str:

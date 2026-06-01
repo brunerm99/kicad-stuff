@@ -351,6 +351,8 @@ class ViaFencerApp:
         suffix = " in one group" if summary.grouped else ""
         skipped = self._skipped_summary(generation.skipped, collision)
         self.status_var.set(f"Created {summary.via_count} fence vias{suffix}{skipped}")
+        if summary.group_error:
+            messagebox.showwarning("Vias created without group", summary.group_error)
         LOGGER.info("Created %d fence vias grouped=%s", summary.via_count, summary.grouped)
 
     def _refresh_nets(self) -> None:
